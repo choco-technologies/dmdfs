@@ -12,6 +12,8 @@
 #include "dmod.h"
 #include "dmdfs.h"
 #include "dmfsi.h"
+#include "dmdrvi.h"
+#include "dmini.h"
 #include <string.h>
 
 /** 
@@ -20,12 +22,68 @@
 #define DMDFS_CONTEXT_MAGIC 0x444D4446  // 'DMDF'
 
 /**
+ * @brief Maximum number of drivers that can be loaded
+ */
+#define MAX_DRIVERS 16
+
+/**
+ * @brief Maximum number of device files that can be created
+ */
+#define MAX_DEVICE_FILES 64
+
+/**
+ * @brief Maximum path length
+ */
+#define MAX_PATH_LEN 256
+
+/**
+ * @brief Device file structure
+ */
+typedef struct
+{
+    char path[MAX_PATH_LEN];           // Device file path (e.g., "dmclk" or "dmuart0" or "dmspi0/0")
+    dmdrvi_context_t driver_ctx;       // Driver context
+    int driver_index;                  // Index into drivers array
+} device_file_t;
+
+/**
+ * @brief Driver information structure
+ */
+typedef struct
+{
+    char name[64];                     // Driver name
+    dmdrvi_context_t context;          // Driver context
+    dmdrvi_dev_num_t dev_num;          // Device numbers
+} driver_info_t;
+
+/**
+ * @brief File handle structure
+ */
+typedef struct
+{
+    void* driver_handle;               // Driver handle from dmdrvi_open
+    device_file_t* device;             // Associated device file
+} file_handle_t;
+
+/**
+ * @brief Directory handle structure
+ */
+typedef struct
+{
+    int current_index;                 // Current index in device files list
+} dir_handle_t;
+
+/**
  * @brief File system context structure
  */
 struct dmfsi_context
 {
     uint32_t magic;
-    void*    driver_context;  // Driver-specific context
+    char config_path[MAX_PATH_LEN];    // Path to configuration directory
+    driver_info_t drivers[MAX_DRIVERS]; // Array of loaded drivers
+    int driver_count;                  // Number of loaded drivers
+    device_file_t devices[MAX_DEVICE_FILES]; // Array of device files
+    int device_count;                  // Number of device files
 };
 
 // ============================================================================
@@ -59,6 +117,198 @@ int dmod_deinit(void)
 }
 
 // ============================================================================
+//                      Helper Functions
+// ============================================================================
+
+/**
+ * @brief Extract filename without extension
+ */
+static void extract_filename_without_ext(const char* filename, char* output, size_t output_size)
+{
+    const char* last_slash = Dmod_Strrchr(filename, '/');
+    const char* base = last_slash ? last_slash + 1 : filename;
+    
+    const char* dot = Dmod_Strrchr(base, '.');
+    size_t len = dot ? (size_t)(dot - base) : Dmod_Strlen(base);
+    
+    if (len >= output_size)
+        len = output_size - 1;
+    
+    Dmod_Memcpy(output, base, len);
+    output[len] = '\0';
+}
+
+/**
+ * @brief Create device files based on driver numbering scheme
+ */
+static int create_device_files(dmfsi_context_t ctx, int driver_index)
+{
+    driver_info_t* driver = &ctx->drivers[driver_index];
+    
+    if (ctx->device_count >= MAX_DEVICE_FILES)
+    {
+        DMOD_LOG_ERROR("dmdfs: Maximum device files limit reached\n");
+        return -1;
+    }
+    
+    device_file_t* dev = &ctx->devices[ctx->device_count];
+    
+    // Create device file path based on numbering scheme
+    if (driver->dev_num.flags == DMDRVI_NUM_NONE)
+    {
+        // Device file: /dev/dmclk (no numbering)
+        Dmod_Snprintf(dev->path, sizeof(dev->path), "%s", driver->name);
+    }
+    else if (driver->dev_num.flags & DMDRVI_NUM_MINOR)
+    {
+        // Device file: /dev/dmspi0/0 (directory structure)
+        Dmod_Snprintf(dev->path, sizeof(dev->path), "%s%d/%d", 
+                     driver->name, driver->dev_num.major, driver->dev_num.minor);
+    }
+    else if (driver->dev_num.flags & DMDRVI_NUM_MAJOR)
+    {
+        // Device file: /dev/dmuart0 (major number only)
+        Dmod_Snprintf(dev->path, sizeof(dev->path), "%s%d", 
+                     driver->name, driver->dev_num.major);
+    }
+    
+    dev->driver_ctx = driver->context;
+    dev->driver_index = driver_index;
+    ctx->device_count++;
+    
+    DMOD_LOG_INFO("dmdfs: Created device file: %s\n", dev->path);
+    
+    return 0;
+}
+
+/**
+ * @brief Load a driver from INI configuration file
+ */
+static int load_driver_from_ini(dmfsi_context_t ctx, const char* ini_path)
+{
+    if (ctx->driver_count >= MAX_DRIVERS)
+    {
+        DMOD_LOG_ERROR("dmdfs: Maximum driver limit reached\n");
+        return -1;
+    }
+    
+    // Parse INI file
+    dmini_context_t ini_ctx = dmini_create();
+    if (!ini_ctx)
+    {
+        DMOD_LOG_ERROR("dmdfs: Failed to create INI context\n");
+        return -1;
+    }
+    
+    int result = dmini_parse_file(ini_ctx, ini_path);
+    if (result != DMINI_OK)
+    {
+        DMOD_LOG_ERROR("dmdfs: Failed to parse INI file: %s\n", ini_path);
+        dmini_destroy(ini_ctx);
+        return -1;
+    }
+    
+    // Get driver name from [main] section, or use filename if not present
+    const char* driver_name = dmini_get_string(ini_ctx, "main", "driver_name", NULL);
+    
+    char name_buf[64];
+    if (driver_name == NULL)
+    {
+        // Use filename without extension as driver name
+        extract_filename_without_ext(ini_path, name_buf, sizeof(name_buf));
+        driver_name = name_buf;
+    }
+    
+    DMOD_LOG_INFO("dmdfs: Loading driver: %s from %s\n", driver_name, ini_path);
+    
+    // Create driver context
+    driver_info_t* driver = &ctx->drivers[ctx->driver_count];
+    Dmod_Strncpy(driver->name, driver_name, sizeof(driver->name) - 1);
+    driver->name[sizeof(driver->name) - 1] = '\0';
+    
+    // Call dmdrvi_create for the driver
+    driver->context = dmdrvi_create(driver->name, ini_ctx, &driver->dev_num);
+    
+    if (!driver->context)
+    {
+        DMOD_LOG_ERROR("dmdfs: Failed to create driver context for: %s\n", driver_name);
+        dmini_destroy(ini_ctx);
+        return -1;
+    }
+    
+    int driver_index = ctx->driver_count;
+    ctx->driver_count++;
+    
+    // Create device files based on numbering scheme
+    create_device_files(ctx, driver_index);
+    
+    dmini_destroy(ini_ctx);
+    return 0;
+}
+
+/**
+ * @brief Scan configuration directory for INI files and load drivers
+ */
+static int scan_and_load_drivers(dmfsi_context_t ctx)
+{
+    // Open configuration directory using SAL
+    void* dir = NULL;
+    int result = Dmod_Opendir(&dir, ctx->config_path);
+    if (result != 0 || !dir)
+    {
+        DMOD_LOG_ERROR("dmdfs: Failed to open configuration directory: %s\n", ctx->config_path);
+        return -1;
+    }
+    
+    // Read directory entries
+    char entry_name[256];
+    int entry_type;
+    
+    while (Dmod_Readdir(dir, entry_name, sizeof(entry_name), &entry_type) == 0)
+    {
+        // Check if file has .ini extension
+        size_t len = Dmod_Strlen(entry_name);
+        if (len > 4 && Dmod_Strcmp(entry_name + len - 4, ".ini") == 0)
+        {
+            // Build full path to INI file
+            char ini_path[MAX_PATH_LEN];
+            Dmod_Snprintf(ini_path, sizeof(ini_path), "%s/%s", ctx->config_path, entry_name);
+            
+            // Load driver from this INI file
+            load_driver_from_ini(ctx, ini_path);
+        }
+    }
+    
+    Dmod_Closedir(dir);
+    
+    DMOD_LOG_INFO("dmdfs: Loaded %d drivers with %d device files\n", 
+                 ctx->driver_count, ctx->device_count);
+    
+    return 0;
+}
+
+/**
+ * @brief Find device file by path
+ */
+static device_file_t* find_device(dmfsi_context_t ctx, const char* path)
+{
+    // Remove leading slash if present
+    const char* search_path = path;
+    if (path[0] == '/')
+        search_path = path + 1;
+    
+    for (int i = 0; i < ctx->device_count; i++)
+    {
+        if (Dmod_Strcmp(ctx->devices[i].path, search_path) == 0)
+        {
+            return &ctx->devices[i];
+        }
+    }
+    
+    return NULL;
+}
+
+// ============================================================================
 //                      DMFSI Interface Implementation
 // ============================================================================
 
@@ -74,10 +324,27 @@ dmod_dmfsi_dif_api_declaration( 1.0, dmdfs, dmfsi_context_t, _init, (const char*
         return NULL;
     }
     
+    Dmod_Memset(ctx, 0, sizeof(struct dmfsi_context));
     ctx->magic = DMDFS_CONTEXT_MAGIC;
-    ctx->driver_context = NULL;
     
-    // TODO: Initialize driver context based on config
+    // Store config path (path to directory containing INI files)
+    if (config)
+    {
+        Dmod_Strncpy(ctx->config_path, config, sizeof(ctx->config_path) - 1);
+        ctx->config_path[sizeof(ctx->config_path) - 1] = '\0';
+        
+        // Scan directory and load all drivers
+        if (scan_and_load_drivers(ctx) != 0)
+        {
+            DMOD_LOG_ERROR("dmdfs: Failed to scan and load drivers\n");
+            Dmod_Free(ctx);
+            return NULL;
+        }
+    }
+    else
+    {
+        DMOD_LOG_WARNING("dmdfs: No config path provided, no drivers loaded\n");
+    }
     
     return ctx;
 }
@@ -89,7 +356,15 @@ dmod_dmfsi_dif_api_declaration( 1.0, dmdfs, int, _deinit, (dmfsi_context_t ctx) 
 {
     if (ctx)
     {
-        // TODO: Cleanup driver context
+        // Free all driver contexts
+        for (int i = 0; i < ctx->driver_count; i++)
+        {
+            if (ctx->drivers[i].context)
+            {
+                dmdrvi_free(ctx->drivers[i].context);
+            }
+        }
+        
         Dmod_Free(ctx);
     }
     return DMFSI_OK;
@@ -114,9 +389,45 @@ dmod_dmfsi_dif_api_declaration( 1.0, dmdfs, int, _fopen, (dmfsi_context_t ctx, v
         return DMFSI_ERR_INVALID;
     }
     
-    // TODO: Implement file opening through driver
-    DMOD_LOG_ERROR("dmdfs: fopen not yet implemented\n");
-    return DMFSI_ERR_GENERAL;
+    // Find the device file
+    device_file_t* device = find_device(ctx, path);
+    if (!device)
+    {
+        DMOD_LOG_ERROR("dmdfs: Device not found: %s\n", path);
+        return DMFSI_ERR_NOT_FOUND;
+    }
+    
+    // Convert DMFSI flags to DMDRVI flags
+    int drv_flags = 0;
+    if (mode & DMFSI_O_RDONLY)
+        drv_flags |= DMDRVI_O_RDONLY;
+    if (mode & DMFSI_O_WRONLY)
+        drv_flags |= DMDRVI_O_WRONLY;
+    if (mode & DMFSI_O_RDWR)
+        drv_flags |= DMDRVI_O_RDWR;
+    
+    // Open device through driver
+    void* driver_handle = dmdrvi_open(ctx->drivers[device->driver_index].name, 
+                                      device->driver_ctx, drv_flags);
+    if (!driver_handle)
+    {
+        DMOD_LOG_ERROR("dmdfs: Failed to open device: %s\n", path);
+        return DMFSI_ERR_GENERAL;
+    }
+    
+    // Create file handle
+    file_handle_t* handle = Dmod_Malloc(sizeof(file_handle_t));
+    if (!handle)
+    {
+        dmdrvi_close(ctx->drivers[device->driver_index].name, device->driver_ctx, driver_handle);
+        return DMFSI_ERR_GENERAL;
+    }
+    
+    handle->driver_handle = driver_handle;
+    handle->device = device;
+    
+    *fp = handle;
+    return DMFSI_OK;
 }
 
 /**
@@ -130,9 +441,17 @@ dmod_dmfsi_dif_api_declaration( 1.0, dmdfs, int, _fclose, (dmfsi_context_t ctx, 
         return DMFSI_ERR_INVALID;
     }
     
-    // TODO: Implement file closing
-    DMOD_LOG_ERROR("dmdfs: fclose not yet implemented\n");
-    return DMFSI_ERR_GENERAL;
+    if (!fp)
+        return DMFSI_ERR_INVALID;
+    
+    file_handle_t* handle = (file_handle_t*)fp;
+    
+    // Close device through driver
+    dmdrvi_close(ctx->drivers[handle->device->driver_index].name,
+                 handle->device->driver_ctx, handle->driver_handle);
+    
+    Dmod_Free(handle);
+    return DMFSI_OK;
 }
 
 /**
@@ -146,9 +465,18 @@ dmod_dmfsi_dif_api_declaration( 1.0, dmdfs, int, _fread, (dmfsi_context_t ctx, v
         return DMFSI_ERR_INVALID;
     }
     
-    // TODO: Implement file reading
-    if (read) *read = 0;
-    return DMFSI_ERR_GENERAL;
+    if (!fp || !buffer || !read)
+        return DMFSI_ERR_INVALID;
+    
+    file_handle_t* handle = (file_handle_t*)fp;
+    
+    // Read from device through driver
+    size_t bytes_read = dmdrvi_read(ctx->drivers[handle->device->driver_index].name,
+                                    handle->device->driver_ctx, 
+                                    handle->driver_handle, buffer, size);
+    
+    *read = bytes_read;
+    return DMFSI_OK;
 }
 
 /**
@@ -162,9 +490,18 @@ dmod_dmfsi_dif_api_declaration( 1.0, dmdfs, int, _fwrite, (dmfsi_context_t ctx, 
         return DMFSI_ERR_INVALID;
     }
     
-    // TODO: Implement file writing
-    if (written) *written = 0;
-    return DMFSI_ERR_GENERAL;
+    if (!fp || !buffer || !written)
+        return DMFSI_ERR_INVALID;
+    
+    file_handle_t* handle = (file_handle_t*)fp;
+    
+    // Write to device through driver
+    size_t bytes_written = dmdrvi_write(ctx->drivers[handle->device->driver_index].name,
+                                        handle->device->driver_ctx,
+                                        handle->driver_handle, buffer, size);
+    
+    *written = bytes_written;
+    return DMFSI_OK;
 }
 
 /**
@@ -268,8 +605,16 @@ dmod_dmfsi_dif_api_declaration( 1.0, dmdfs, int, _fflush, (dmfsi_context_t ctx, 
         return DMFSI_ERR_INVALID;
     }
     
-    // TODO: Implement buffer flushing
-    return DMFSI_OK;
+    if (!fp)
+        return DMFSI_ERR_INVALID;
+    
+    file_handle_t* handle = (file_handle_t*)fp;
+    
+    // Flush through driver
+    int result = dmdrvi_flush(ctx->drivers[handle->device->driver_index].name,
+                              handle->device->driver_ctx, handle->driver_handle);
+    
+    return (result == 0) ? DMFSI_OK : DMFSI_ERR_GENERAL;
 }
 
 /**
@@ -283,8 +628,16 @@ dmod_dmfsi_dif_api_declaration( 1.0, dmdfs, int, _sync, (dmfsi_context_t ctx, vo
         return DMFSI_ERR_INVALID;
     }
     
-    // TODO: Implement sync
-    return DMFSI_OK;
+    if (!fp)
+        return DMFSI_ERR_INVALID;
+    
+    file_handle_t* handle = (file_handle_t*)fp;
+    
+    // Sync through driver (same as flush for devices)
+    int result = dmdrvi_flush(ctx->drivers[handle->device->driver_index].name,
+                              handle->device->driver_ctx, handle->driver_handle);
+    
+    return (result == 0) ? DMFSI_OK : DMFSI_ERR_GENERAL;
 }
 
 /**
@@ -298,8 +651,24 @@ dmod_dmfsi_dif_api_declaration( 1.0, dmdfs, int, _opendir, (dmfsi_context_t ctx,
         return DMFSI_ERR_INVALID;
     }
     
-    // TODO: Implement directory opening
-    return DMFSI_ERR_GENERAL;
+    // Only root directory is supported
+    if (path && Dmod_Strcmp(path, "/") != 0 && Dmod_Strlen(path) > 0)
+    {
+        DMOD_LOG_ERROR("dmdfs: Only root directory is supported\n");
+        return DMFSI_ERR_NOT_FOUND;
+    }
+    
+    // Create directory handle
+    dir_handle_t* handle = Dmod_Malloc(sizeof(dir_handle_t));
+    if (!handle)
+    {
+        return DMFSI_ERR_GENERAL;
+    }
+    
+    handle->current_index = 0;
+    *dp = handle;
+    
+    return DMFSI_OK;
 }
 
 /**
@@ -313,8 +682,27 @@ dmod_dmfsi_dif_api_declaration( 1.0, dmdfs, int, _readdir, (dmfsi_context_t ctx,
         return DMFSI_ERR_INVALID;
     }
     
-    // TODO: Implement directory reading
-    return DMFSI_ERR_NOT_FOUND;
+    if (!dp || !entry)
+        return DMFSI_ERR_INVALID;
+    
+    dir_handle_t* handle = (dir_handle_t*)dp;
+    
+    // Check if we've reached the end
+    if (handle->current_index >= ctx->device_count)
+    {
+        return DMFSI_ERR_NOT_FOUND;
+    }
+    
+    // Fill in entry information
+    device_file_t* device = &ctx->devices[handle->current_index];
+    Dmod_Strncpy(entry->name, device->path, sizeof(entry->name) - 1);
+    entry->name[sizeof(entry->name) - 1] = '\0';
+    entry->type = DMFSI_TYPE_FILE;
+    entry->size = 0;  // Device files don't have a fixed size
+    
+    handle->current_index++;
+    
+    return DMFSI_OK;
 }
 
 /**
@@ -328,8 +716,12 @@ dmod_dmfsi_dif_api_declaration( 1.0, dmdfs, int, _closedir, (dmfsi_context_t ctx
         return DMFSI_ERR_INVALID;
     }
     
-    // TODO: Implement directory closing
-    return DMFSI_ERR_GENERAL;
+    if (dp)
+    {
+        Dmod_Free(dp);
+    }
+    
+    return DMFSI_OK;
 }
 
 /**
@@ -373,8 +765,28 @@ dmod_dmfsi_dif_api_declaration( 1.0, dmdfs, int, _stat, (dmfsi_context_t ctx, co
         return DMFSI_ERR_INVALID;
     }
     
-    // TODO: Implement stat
-    return DMFSI_ERR_GENERAL;
+    if (!stat)
+        return DMFSI_ERR_INVALID;
+    
+    // Check for root directory
+    if (!path || Dmod_Strcmp(path, "/") == 0 || Dmod_Strlen(path) == 0)
+    {
+        stat->type = DMFSI_TYPE_DIR;
+        stat->size = 0;
+        return DMFSI_OK;
+    }
+    
+    // Find the device file
+    device_file_t* device = find_device(ctx, path);
+    if (!device)
+    {
+        return DMFSI_ERR_NOT_FOUND;
+    }
+    
+    stat->type = DMFSI_TYPE_FILE;
+    stat->size = 0;  // Device files don't have a predetermined size
+    
+    return DMFSI_OK;
 }
 
 /**

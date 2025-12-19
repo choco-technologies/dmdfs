@@ -59,7 +59,48 @@ DMDFS is part of a modular embedded file system architecture built on DMOD:
 - **[DMOD](https://github.com/choco-technologies/dmod)**: The foundation providing dynamic module loading, inter-module communication, and resource management
 - **[DMFSI](https://github.com/choco-technologies/dmfsi)**: Defines the standard file system interface that DMDFS implements
 - **[DMVFS](https://github.com/choco-technologies/dmvfs)**: Virtual file system layer that can mount DMDFS at any path in a unified directory tree
+- **[DMDRVI](https://github.com/choco-technologies/dmdrvi)**: Driver interface that all hardware drivers must implement
+- **[DMINI](https://github.com/choco-technologies/dmini)**: INI file parser used for driver configuration
 - **DMDFS**: This project - implements DMFSI to provide access to driver-based storage
+
+## How It Works
+
+DMDFS scans a configuration directory for `*.ini` files, where each file contains configuration for a specific driver. The module:
+
+1. **Scans Configuration Directory**: When mounted, DMDFS scans the provided directory for all `*.ini` files
+2. **Parses Driver Configuration**: Each INI file should contain a `[main]` section with `driver_name` parameter:
+   ```ini
+   ; Configuration for clock driver
+   [main]
+   driver_name=dmclk
+   
+   ; Additional driver-specific settings
+   frequency=48000000
+   ```
+3. **Determines Driver Name**: If `driver_name` is not specified, the filename (without .ini extension) is used
+4. **Initializes Drivers**: Calls `dmdrvi_create()` for each driver with the parsed configuration
+5. **Creates Device Files**: Based on the device numbering scheme returned by the driver:
+   - **No numbering** (DMDRVI_NUM_NONE): Creates `/dev/dmclk`
+   - **Major only** (DMDRVI_NUM_MAJOR): Creates `/dev/dmuart0`, `/dev/dmuart1`, etc.
+   - **Major + Minor** (DMDRVI_NUM_MAJOR | DMDRVI_NUM_MINOR): Creates `/dev/dmspi0/0`, `/dev/dmspi0/1`, etc.
+
+### Example Configuration
+
+Create INI files in your configuration directory:
+
+**dmclk.ini** (driver name from filename):
+```ini
+[main]
+frequency=48000000
+```
+
+**uart_config.ini** (explicit driver name):
+```ini
+[main]
+driver_name=dmuart
+port=0
+baudrate=115200
+```
 
 ## Building
 
@@ -80,17 +121,18 @@ The module can be loaded and mounted using DMVFS:
 // Initialize DMVFS
 dmvfs_init(16, 32);
 
-// Mount the driver filesystem at /mnt
-dmvfs_mount_fs("dmdfs", "/mnt", NULL);
+// Mount the driver filesystem at /dev with configuration directory
+// The third parameter is the path to a directory containing *.ini driver configuration files
+dmvfs_mount_fs("dmdfs", "/dev", "/path/to/config/directory");
 
-// Use standard file operations
+// Use standard file operations to access device files
 void* fp;
-dmvfs_fopen(&fp, "/mnt/file.txt", DMFSI_O_RDONLY, 0, 0);
-// ... use file ...
+dmvfs_fopen(&fp, "/dev/dmclk", DMFSI_O_RDWR, 0, 0);
+// ... use device ...
 dmvfs_fclose(fp);
 
 // Unmount when done
-dmvfs_unmount_fs("/mnt");
+dmvfs_unmount_fs("/dev");
 dmvfs_deinit();
 ```
 

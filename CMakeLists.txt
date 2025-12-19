@@ -57,6 +57,26 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(dmfsi)
 
 # ======================================================================
+#               Fetch DMDRVI (Driver Interface)
+# ======================================================================
+FetchContent_Declare(
+    dmdrvi
+    GIT_REPOSITORY https://github.com/choco-technologies/dmdrvi.git
+    GIT_TAG        main
+)
+FetchContent_MakeAvailable(dmdrvi)
+
+# ======================================================================
+#               Fetch DMINI (INI Parser)
+# ======================================================================
+FetchContent_Declare(
+    dmini
+    GIT_REPOSITORY https://github.com/choco-technologies/dmini.git
+    GIT_TAG        main
+)
+FetchContent_MakeAvailable(dmini)
+
+# ======================================================================
 #               DMDFS Module Configuration
 # ======================================================================
 # Name of the module 
@@ -84,7 +104,15 @@ dmod_add_library(${DMOD_MODULE_NAME} ${DMOD_MODULE_VERSION}
 
 target_include_directories(${DMOD_MODULE_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${dmdrvi_SOURCE_DIR}/include
+    ${dmdrvi_BINARY_DIR}
+    ${dmini_SOURCE_DIR}/include
+    ${dmini_BINARY_DIR}
 )
 
-# Link to DMFSI interface
+# Link to DMFSI interface and dmdrvi, dmini modules
+dmod_link_modules(${DMOD_MODULE_NAME}
+    dmini
+    dmdrvi
+)
 target_link_libraries(${DMOD_MODULE_NAME} dmfsi_if)
